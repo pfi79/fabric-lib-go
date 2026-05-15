@@ -16,6 +16,8 @@ import (
 	"encoding/asn1"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -871,4 +873,60 @@ func TestHandleSessionReturn(t *testing.T) {
 	_, err = csp.KeyGen(&bccsp.ECDSAP256KeyGenOpts{Temporary: false})
 	require.EqualError(t, err, "Failed generating ECDSA P256 key: P11: keypair generate failed [pkcs11: 0xB3: CKR_SESSION_HANDLE_INVALID]")
 	require.Empty(t, csp.sessPool, "sessionPool should be empty")
+}
+
+func TestPKCS11SessionLimit(t *testing.T) {
+	// Exercise the package default so the limit under test matches what
+	// production callers will actually see, not a test-only override.
+	const (
+		cacheSize = defaultSessionCacheSize
+		callers   = 5 * defaultSessionCacheSize
+		holdFor   = 50 * time.Millisecond
+	)
+
+	opts := defaultOptions()
+	csp, cleanup := newProvider(t, opts)
+	defer cleanup()
+
+	countOutstanding := func() int32 {
+		csp.sessLock.Lock()
+		defer csp.sessLock.Unlock()
+		return int32(len(csp.sessions))
+	}
+
+	var peak int32
+	recordPeak := func() {
+		cur := countOutstanding()
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				return
+			}
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			sess, err := csp.getSession()
+			if err != nil {
+				t.Errorf("getSession: %v", err)
+				return
+			}
+			recordPeak()
+			time.Sleep(holdFor)
+			csp.returnSession(sess)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	require.LessOrEqualf(t, peak, int32(cacheSize),
+		"peak concurrent open PKCS#11 sessions %d exceeded sessionCacheSize %d "+
+			"(unbounded createSession fall-through; see issue #50)",
+		peak, cacheSize)
 }
